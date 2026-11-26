@@ -1,0 +1,8 @@
+[Unit]
+Description=Scan Claude Code transcripts for usage limit stops and schedule resumes
+
+[Service]
+Type=oneshot
+ExecStart=@PYTHON@ @DIR@/detect.py scan
+Nice=10
+@ENV@

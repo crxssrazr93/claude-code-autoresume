@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+tests/.work/
+.env
+*.log
+state.json
