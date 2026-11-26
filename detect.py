@@ -7,16 +7,15 @@ each, at the limit reset plus 5 minutes.
 """
 
 import argparse
-import fcntl
 import os
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lib  # noqa: E402
+from platform_linux import SystemdScheduler  # noqa: E402,F401  (kept for older imports)
 
 HERE = Path(__file__).resolve().parent
 
@@ -25,22 +24,11 @@ def unit_name(session_id, reset):
     return f"claude-autoresume-{session_id[:8]}-{reset}"
 
 
-class SystemdScheduler:
-    def schedule(self, unit, fire_at, event_id, runner=lib.run):
-        when = datetime.fromtimestamp(fire_at, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        cmd = ["systemd-run", "--user", "--quiet", f"--unit={unit}",
-               f"--description=auto-resume {event_id}",
-               f"--on-calendar={when}",
-               "--timer-property=AccuracySec=1s",
-               "--timer-property=RemainAfterElapse=no",
-               *[f"--setenv={k}={os.environ[k]}" for k in ("CLAUDE_CONFIG_DIR", "XDG_DATA_HOME", "AUTORESUME_MESSAGE") if k in os.environ],
-               sys.executable, str(HERE / "fire.py"), event_id]
-        rc, _, err = runner(cmd)
-        return rc == 0, err
-
-    def active(self, unit, runner=lib.run):
-        rc, out, _ = runner(["systemctl", "--user", "is-active", f"{unit}.timer"])
-        return out == "active"
+def run_due_polled(paths, event_ids, runner):
+    """Deliver resumes that are due when the scheduler has no timer of its own."""
+    import fire
+    for eid in event_ids:
+        fire.fire(paths, eid, runner=runner)
 
 
 def candidate_transcripts(paths, now, lookback_hours):
@@ -65,7 +53,7 @@ def scan(paths, now=None, dry_run=False, lookback_hours=48, scheduler=None,
          runner=lib.run, echo=False, tz=None):
     """Returns a list of Decisions. Writes state and timers unless dry_run."""
     now = now if now is not None else time.time()
-    scheduler = scheduler or SystemdScheduler()
+    scheduler = scheduler or lib.current_platform().Scheduler()
     state = lib.load_state(paths)
     events = state.setdefault("events", {})
     procs = lib.find_claude_processes(paths)
@@ -87,6 +75,16 @@ def scan(paths, now=None, dry_run=False, lookback_hours=48, scheduler=None,
             e["reason"] = "timer vanished without firing"
             changed = True
             lib.log(paths, f"{e['unit']} vanished without firing", echo)
+
+    # Schedulers that leave a job behind (launchd, Task Scheduler) get it removed
+    # once the event is done. This runs in a later scan, never inside the job itself.
+    if getattr(scheduler, "needs_cleanup", False) and not dry_run:
+        for e in events.values():
+            if e.get("unit") and e.get("status") in ("fired", "failed", "superseded") \
+                    and not e.get("cleaned"):
+                scheduler.cancel(e["unit"], runner)
+                e["cleaned"] = True
+                changed = True
 
     seen_sessions = set()
     for tpath in sorted(candidate_transcripts(paths, now, lookback_hours)):
@@ -135,18 +133,24 @@ def scan(paths, now=None, dry_run=False, lookback_hours=48, scheduler=None,
 
     if changed and not dry_run:
         lib.save_state(paths, state)
+    if getattr(scheduler, "polls", False) and not dry_run:
+        due = [eid for eid, e in events.items()
+               if e.get("status") == "scheduled" and e.get("fire_at", now + 1) <= now]
+        run_due_polled(paths, due, runner)
     return results
 
 
 def status(paths, runner=lib.run, now=None):
     now = now if now is not None else time.time()
+    print(lib.describe_environment(paths))
+    scheduler = lib.current_platform().Scheduler()
     state = lib.load_state(paths)
     rows = [(e["fire_at"], eid, e) for eid, e in state.get("events", {}).items()
             if e.get("status") == "scheduled"]
     if not rows:
         print("No pending resumes.")
     for fire_at, eid, e in sorted(rows):
-        active = SystemdScheduler().active(e["unit"], runner)
+        active = scheduler.active(e["unit"], runner)
         print(f"{lib.fmt(fire_at)}  session {e['session_id'][:8]}  pid {e.get('pid')}  "
               f"{e['unit']}  timer={'active' if active else 'MISSING'}  "
               f"({int((fire_at - now) / 60)} min away)")
@@ -178,11 +182,13 @@ def main(argv=None):
               f"{sum(1 for r in results if r.action == 'schedule')} would be scheduled")
         return 0
     with open(paths.data / "scan.lock", "w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        if not lib.try_lock(lock):
             return 0  # another scan is running
-        scan(paths, lookback_hours=args.lookback_hours, tz=tz)
+        try:
+            scan(paths, lookback_hours=args.lookback_hours, tz=tz)
+        except ImportError as e:  # psutil missing on macOS or Windows
+            lib.log(paths, f"scan cannot run: {e}", echo=True)
+            return 1
     return 0
 
 

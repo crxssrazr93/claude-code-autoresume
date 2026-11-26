@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -46,10 +47,12 @@ class Paths:
 
     @classmethod
     def from_env(cls):
-        """Real install: honour CLAUDE_CONFIG_DIR and XDG_DATA_HOME when set."""
+        """Real install: honour CLAUDE_CONFIG_DIR and XDG_DATA_HOME when set. The
+        home directory comes from the platform (USERPROFILE on Windows)."""
         claude = os.environ.get("CLAUDE_CONFIG_DIR")
         xdg = os.environ.get("XDG_DATA_HOME")
-        return cls(claude_dir=Path(claude) if claude else None,
+        return cls(home=current_platform().home_dir(os.environ),
+                   claude_dir=Path(claude) if claude else None,
                    data_dir=Path(xdg) / "auto-resume" if xdg else None)
 
     @property
@@ -66,7 +69,7 @@ class Paths:
 
     @property
     def data(self):
-        return self.data_dir or self.home / ".local/share/auto-resume"
+        return self.data_dir or current_platform().default_data_dir(self.home)
 
     @property
     def state_file(self):
@@ -249,6 +252,9 @@ def background_activity_ts(paths, cwd_slug, session_id):
     except AttributeError:  # pragma: no cover
         uid = 0
     roots.append(Path(f"/tmp/claude-{uid}") / cwd_slug / session_id / "tasks")
+    if sys.platform != "linux":  # macOS and Windows keep temp files elsewhere
+        import tempfile
+        roots.append(Path(tempfile.gettempdir()) / f"claude-{uid}" / cwd_slug / session_id / "tasks")
     for root in roots:
         if not root.is_dir():
             continue
@@ -271,44 +277,46 @@ class Proc:
     how: str
 
 
-def _read(path):
-    try:
-        return Path(path).read_bytes()
-    except OSError:
-        return b""
+DEFAULT_PROC = Path("/proc")
 
 
-def proc_stat(paths, pid):
+def current_platform():
+    """The platform object (see platform_base.py)."""
+    import platform_base
+    return platform_base.current()
+
+
+def proc_source(paths):
+    """Where process facts come from: psutil, or /proc (always, for a fake /proc)."""
+    return current_platform().proc_source(paths)
+
+
+def exe_name(name):
+    """'C:\\x\\Claude.EXE' -> 'claude'."""
+    n = re.split(r"[\\/]", name or "")[-1].lower()
+    return n[:-4] if n.endswith(".exe") else n
+
+
+def proc_stat(paths, pid, source=None):
     """Return (ppid, pgrp, starttime) or None."""
-    raw = _read(paths.proc / str(pid) / "stat").decode("utf-8", "replace")
-    if not raw:
-        return None
-    rest = raw[raw.rfind(")") + 2:].split()
-    try:
-        return int(rest[1]), int(rest[2]), rest[19]
-    except (IndexError, ValueError):
-        return None
+    return (source or proc_source(paths)).stat(pid)
 
 
-def proc_is_claude(paths, pid):
-    comm = _read(paths.proc / str(pid) / "comm").decode().strip()
+def proc_is_claude(paths, pid, source=None):
+    comm = exe_name((source or proc_source(paths)).name(pid))
     return comm in ("claude", "node") or comm.startswith("claude")
 
 
-def proc_environ(paths, pid):
-    env = {}
-    for item in _read(paths.proc / str(pid) / "environ").split(b"\0"):
-        k, _, v = item.partition(b"=")
-        if k:
-            env[k.decode("utf-8", "replace")] = v.decode("utf-8", "replace")
-    return env
+def proc_environ(paths, pid, source=None):
+    return (source or proc_source(paths)).environ(pid)
 
 
-def ancestors(paths, pid):
+def ancestors(paths, pid, source=None):
+    source = source or proc_source(paths)
     seen = []
     while pid and pid > 1 and pid not in seen and len(seen) < 64:
         seen.append(pid)
-        st = proc_stat(paths, pid)
+        st = source.stat(pid)
         if not st:
             break
         pid = st[0]
@@ -318,10 +326,12 @@ def ancestors(paths, pid):
 def find_claude_processes(paths):
     """Map session id -> Proc for live claude processes.
 
-    Order of evidence: ~/.claude/sessions/<pid>.json (validated against the
-    process start time), a `--resume <uuid>` argument, a tasks directory held
-    open as a file descriptor, and finally a cwd that matches exactly one
-    transcript project with a recently written transcript."""
+    Order of evidence: the session registry (`sessions/<pid>.json` in the Claude
+    config directory), validated against the process start time where the platform
+    can tell it, a `--resume <uuid>` argument, a tasks directory held open as a file
+    descriptor, and finally a cwd that matches exactly one transcript project with a
+    recently written transcript."""
+    source = proc_source(paths)
     found = {}
     # 1. session registry written by Claude Code itself
     if paths.sessions.is_dir():
@@ -332,30 +342,21 @@ def find_claude_processes(paths):
                 sid = d["sessionId"]
             except Exception:
                 continue
-            st = proc_stat(paths, pid)
-            if not st or not proc_is_claude(paths, pid):
+            st = source.stat(pid)
+            if not st or not proc_is_claude(paths, pid, source):
                 continue
-            if d.get("procStart") and str(d["procStart"]) != st[2]:
+            if d.get("procStart") and st[2] is not None and str(d["procStart"]) != st[2]:
                 continue  # pid was reused by something else
             found[sid] = Proc(pid, sid, d.get("cwd", ""), "sessions-registry")
     known_pids = {p.pid for p in found.values()}
     uuid_re = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-    if not paths.proc.is_dir():
-        return found
-    for entry in paths.proc.iterdir():
-        if not entry.name.isdigit():
+    for pid in source.pids():
+        if pid in known_pids or not proc_is_claude(paths, pid, source):
             continue
-        pid = int(entry.name)
-        if pid in known_pids or not proc_is_claude(paths, pid):
+        cmd = [c for c in source.cmdline(pid) if c]
+        if not cmd or exe_name(cmd[0]) != "claude" or "--chrome-native-host" in cmd:
             continue
-        cmd = _read(entry / "cmdline").split(b"\0")
-        cmd = [c.decode("utf-8", "replace") for c in cmd if c]
-        if not cmd or os.path.basename(cmd[0]) != "claude" or "--chrome-native-host" in cmd:
-            continue
-        try:
-            cwd = os.readlink(entry / "cwd")
-        except OSError:
-            cwd = ""
+        cwd = source.cwd(pid)
         sid = None
         how = ""
         for i, a in enumerate(cmd):
@@ -363,19 +364,11 @@ def find_claude_processes(paths):
                     and uuid_re.fullmatch(cmd[i + 1]):
                 sid, how = cmd[i + 1], "cmdline"
         if not sid:
-            fd_dir = entry / "fd"
-            try:
-                for fd in fd_dir.iterdir():
-                    try:
-                        target = os.readlink(fd)
-                    except OSError:
-                        continue
-                    m = re.search(r"/claude-\d+/[^/]+/(" + uuid_re.pattern + r")/tasks", target)
-                    if m:
-                        sid, how = m.group(1), "fd-tasks"
-                        break
-            except OSError:
-                pass
+            for target in source.open_files(pid):
+                m = re.search(r"/claude-\d+/[^/]+/(" + uuid_re.pattern + r")/tasks", target)
+                if m:
+                    sid, how = m.group(1), "fd-tasks"
+                    break
         if not sid and cwd:
             slug = cwd_slug(cwd)
             proj = paths.projects / slug
@@ -386,6 +379,33 @@ def find_claude_processes(paths):
         if sid and sid not in found:
             found[sid] = Proc(pid, sid, cwd, how)
     return found
+
+
+def describe_environment(paths):
+    """One line for bug reports: platform, process source, registry directory."""
+    plat = current_platform()
+    try:
+        src = type(plat.proc_source(paths)).__name__
+    except ImportError as e:
+        src = f"unavailable ({e})"
+    return (f"platform={plat.name} python={sys.version.split()[0]} process-source={src} "
+            f"registry={paths.sessions} data={paths.data}")
+
+
+def try_lock(fileobj):
+    """Take a non blocking exclusive lock on an open file. False when another
+    process holds it."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fileobj.seek(0)
+            msvcrt.locking(fileobj.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fileobj, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
 
 
 def cwd_slug(cwd):
@@ -438,14 +458,24 @@ def peer_frame(text, name=PEER_FROM, mode="bypass", msg_id=None):
                        "priority": "next", "from": name}) + "\n"
 
 
-def send_peer(sock_path, text, name=PEER_FROM, timeout=5, mode="bypass"):
-    """Write one message frame to a session inbox socket. Returns (ok, detail)."""
+def send_peer(sock_path, text, name=PEER_FROM, timeout=5, mode="bypass", opener=open):
+    """Write one message frame to a session inbox. Returns (ok, detail).
+
+    The path comes from the session registry. A Unix socket path is used on Linux
+    and macOS. A Windows named pipe path (\\\\.\\pipe\\...) gets the same frame
+    through plain binary file I/O."""
     import socket
+    frame = peer_frame(text, name, mode).encode()
+    import platform_windows
+    if platform_windows.is_pipe_path(sock_path):
+        return platform_windows.send_pipe(sock_path, frame, opener)
+    if not hasattr(socket, "AF_UNIX"):
+        return False, f"no Unix socket support on this platform, cannot use {sock_path}"
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
         s.connect(sock_path)
-        s.sendall(peer_frame(text, name, mode).encode())
+        s.sendall(frame)
         return True, f"frame written to {sock_path}"
     except OSError as e:
         return False, f"inbox socket unreachable: {e}"
@@ -455,8 +485,9 @@ def send_peer(sock_path, text, name=PEER_FROM, timeout=5, mode="bypass"):
 
 # ------------------------------------------------------------------- terminals --
 def candidate_targets(paths, session_id, pid, transcript=None):
-    """Delivery routes in preference order: the session's own inbox socket
-    (works while idle, needs no terminal), then tmux, then Konsole D-Bus."""
+    """Delivery routes in preference order: the session's own inbox socket or pipe
+    (works while idle, needs no terminal), then tmux, then a terminal API (Konsole
+    D-Bus on Linux, the iTerm2 Python API on macOS)."""
     out = []
     sock = peer_socket(paths, session_id)
     if sock:
@@ -474,6 +505,8 @@ def terminal_target(paths, pid):
     env = proc_environ(paths, pid)
     if env.get("TMUX") and env.get("TMUX_PANE"):
         return {"kind": "tmux", "socket": env["TMUX"].split(",")[0], "pane": env["TMUX_PANE"]}
+    if env.get("ITERM_SESSION_ID") and ":" in env["ITERM_SESSION_ID"]:
+        return {"kind": "iterm2", "session": env["ITERM_SESSION_ID"].split(":", 1)[1]}
     if env.get("KONSOLE_DBUS_SERVICE") and env.get("KONSOLE_DBUS_SESSION"):
         return {"kind": "konsole", "service": env["KONSOLE_DBUS_SERVICE"],
                 "session": env["KONSOLE_DBUS_SESSION"]}
@@ -488,19 +521,16 @@ def run(cmd, timeout=10):
     return r.returncode, r.stdout.strip(), r.stderr.strip()
 
 
-def _qdbus():
-    for name in ("qdbus6", "qdbus", "qdbus-qt6"):
-        for d in os.environ.get("PATH", "").split(os.pathsep):
-            if os.access(os.path.join(d, name), os.X_OK):
-                return os.path.join(d, name)
-    return "qdbus"
-
-
 def verify_target(paths, pid, target, runner=run):
     """Confirm the target terminal really hosts claude process `pid`.
     Returns (ok, detail)."""
     chain = ancestors(paths, pid)
     if target["kind"] == "peer":
+        import platform_windows
+        if platform_windows.is_pipe_path(target["socket"]):
+            # A pipe cannot be probed without taking a connection from the session.
+            # The registry entry was already tied to a live claude process.
+            return True, "session inbox pipe (named pipe, not probed)"
         import stat
         try:
             st = os.stat(target["socket"])
@@ -510,30 +540,11 @@ def verify_target(paths, pid, target, runner=run):
             return False, "inbox socket is not a socket owned by this user"
         return True, "session inbox socket"
     if target["kind"] == "konsole":
-        q = _qdbus()
-        if not q:
-            return False, "qdbus not found"
-        rc, out, err = runner([q, target["service"], target["session"],
-                               "org.kde.konsole.Session.processId"])
-        if rc != 0 or not out.isdigit():
-            return False, f"konsole session unreachable: {err or out}"
-        if int(out) not in chain:
-            return False, f"konsole shell pid {out} is not an ancestor of claude {pid}"
-        rc, fg, err = runner([q, target["service"], target["session"],
-                              "org.kde.konsole.Session.foregroundProcessId"])
-        st = proc_stat(paths, pid)
-        if rc == 0 and fg.isdigit() and st and int(fg) != st[1] and int(fg) != pid:
-            return False, f"claude is not the foreground job (foreground={fg})"
-        # An empty sendText types nothing, but is refused when Konsole's
-        # "security sensitive DBus API" setting is off, so it is a safe probe.
-        rc, _, err = runner([q, target["service"], target["session"],
-                             "org.kde.konsole.Session.sendText", ""])
-        if rc != 0:
-            if "ecurity" in err or "AccessDenied" in err:
-                return False, ("Konsole refuses sendText: enable 'security sensitive DBus API' "
-                               "in Konsole settings (Configure Konsole, General)")
-            return False, f"konsole sendText probe failed: {err}"
-        return True, f"konsole shell {out}"
+        import platform_linux
+        return platform_linux.konsole_verify(paths, pid, target, runner)
+    if target["kind"] == "iterm2":
+        import platform_macos
+        return platform_macos.iterm2_verify(paths, pid, target, runner)
     if target["kind"] == "tmux":
         rc, out, err = runner(["tmux", "-S", target["socket"], "display-message", "-p",
                                "-t", target["pane"], "#{pane_pid}"])
@@ -552,15 +563,11 @@ def send_message(target, message, runner=run, pause=None):
     if target["kind"] == "peer":
         return send_peer(target["socket"], message, mode=target.get("mode"))
     if target["kind"] == "konsole":
-        q = _qdbus()
-        base = [q, target["service"], target["session"], "org.kde.konsole.Session.sendText"]
-        rc, _, err = runner(base + [message])
-        if rc != 0:
-            return False, err
-        if pause:
-            time.sleep(pause)
-        rc, _, err = runner(base + ["\r"])
-        return rc == 0, err
+        import platform_linux
+        return platform_linux.konsole_send(target, message, runner, pause)
+    if target["kind"] == "iterm2":
+        import platform_macos
+        return platform_macos.iterm2_send(target, message, runner, pause)
     if target["kind"] == "tmux":
         base = ["tmux", "-S", target["socket"], "send-keys", "-t", target["pane"]]
         rc, _, err = runner(base + ["-l", "--", message])
@@ -675,11 +682,8 @@ def native_cron_conflict(transcript, lo, hi, tz=None, since=None):
 
 
 def proc_start_epoch(paths, pid):
-    """When a process started, from its /proc entry; None if unknown."""
-    try:
-        return (paths.proc / str(pid)).stat().st_ctime
-    except OSError:
-        return None
+    """When a process started; None if unknown."""
+    return proc_source(paths).start_epoch(pid)
 
 
 def scheduled_resume_conflict(paths, session_id, slug, lo, hi, runner=run):
@@ -803,8 +807,7 @@ def evaluate(paths, session_id, transcript, procs, state, now, runner=run, tz=No
 
     cands = candidate_targets(paths, session_id, proc.pid, transcript)
     if not cands:
-        return skip("no inbox socket and no addressable terminal (not Konsole or tmux); "
-                    "focused-window injection is never used", transient=True)
+        return skip(current_platform().no_route_reason, transient=True)
     target, detail, problems = None, "", []
     for cand in cands:
         ok, why = verify_target(paths, proc.pid, cand, runner)

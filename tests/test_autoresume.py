@@ -22,6 +22,11 @@ SID = "11111111-aaaa-bbbb-cccc-000000000001"
 SLUG = "-home-user-proj"
 MSG = lib.MESSAGE
 
+posix_only = unittest.skipIf(
+    sys.platform == "win32",
+    "these tests build a fake /proc with symlinks and use Unix sockets; "
+    "Windows is covered by tests/test_platforms.py")
+
 
 class FakeScheduler:
     def __init__(self):
@@ -146,6 +151,7 @@ class TestParse(unittest.TestCase):
         self.assertFalse(lib.cron_matches("47 * * * *", dt))
 
 
+@posix_only
 class TestEvaluate(unittest.TestCase):
     def setUp(self):
         self.env = Env()
@@ -363,6 +369,7 @@ class TestEvaluate(unittest.TestCase):
         self.assertEqual(d.target["pane"], "%3")
 
 
+@posix_only
 class TestProcessMapping(unittest.TestCase):
     def setUp(self):
         self.env = Env()
@@ -422,6 +429,7 @@ class TestProcessMapping(unittest.TestCase):
                          "-home-a-Desktop-Tools-Demo-Client-Projects")
 
 
+@posix_only
 class TestScanAndFire(unittest.TestCase):
     def setUp(self):
         self.env = Env()
@@ -505,6 +513,7 @@ class TestScanAndFire(unittest.TestCase):
         self.assertEqual(tm[1][-1], "Enter")
 
 
+@posix_only
 class TestPeerRoute(unittest.TestCase):
     """Native delivery: a frame written to the session's own inbox socket."""
 
@@ -515,7 +524,10 @@ class TestPeerRoute(unittest.TestCase):
         self.addCleanup(self.env.close)
         self.env.transcript("limit_active.jsonl")
         self.env.live_session()
-        self.sock_path = str(self.env.root / "s.sock")
+        # Unix socket paths are limited to about 104 bytes on macOS, so use a short directory.
+        short = tempfile.mkdtemp(prefix="ar")
+        self.addCleanup(shutil.rmtree, short, True)
+        self.sock_path = os.path.join(short, "s.sock")
         self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.srv.bind(self.sock_path)
         self.srv.listen(4)
@@ -620,7 +632,9 @@ class TestPathsFromEnv(unittest.TestCase):
     def test_defaults_follow_home(self):
         p = lib.Paths(home=Path("/h"))
         self.assertEqual(p.projects, Path("/h/.claude/projects"))
-        self.assertEqual(p.data, Path("/h/.local/share/auto-resume"))
+        self.assertEqual(p.data, lib.current_platform().default_data_dir(Path("/h")))
+        if sys.platform.startswith("linux"):
+            self.assertEqual(p.data, Path("/h/.local/share/auto-resume"))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fired by a one-shot systemd timer. Re-verifies everything, then types the
+"""Fired by a one shot job (systemd timer, LaunchAgent or scheduled task). Re-verifies everything, then types the
 resume message into the session's own terminal.
 
     fire.py <event_id> [--dry-run]
