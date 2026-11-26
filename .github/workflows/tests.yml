@@ -6,13 +6,60 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} / python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      # psutil lists processes on macOS and Windows. tzdata gives Windows the time zone database.
+      - run: python -m pip install psutil tzdata
       - run: python -m unittest discover -s tests -v
+
+      - name: Generated files are well formed (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          python platform_macos.py detect-plist --python "$(command -v python)" --dir "$PWD" --log "$RUNNER_TEMP/l.log" --out "$RUNNER_TEMP/detect.plist"
+          plutil -lint "$RUNNER_TEMP/detect.plist"
+
+      - name: Generated files and scripts are well formed (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python platform_windows.py detect-task-xml --python (Get-Command python).Source --dir $PWD --out "$env:RUNNER_TEMP\detect.xml"
+          foreach ($f in 'install.ps1', 'uninstall.ps1', 'ensure.ps1') {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD\$f", [ref]$null, [ref]$errors)
+            if ($errors) { $errors; exit 1 }
+          }
+
+      - name: Shell scripts parse (Linux and macOS)
+        if: runner.os != 'Windows'
+        run: bash -n install.sh && bash -n uninstall.sh && bash -n ensure.sh
+
+      # These two run the real installers. A hosted runner may lack a login session, so they
+      # report but do not block. Read their log when you change an installer.
+      - name: Installer round trip (macOS, informational)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: |
+          ./install.sh --dir "$RUNNER_TEMP/ar" --skip-tests
+          launchctl print "gui/$(id -u)/com.claude-code-autoresume.detect"
+          python "$RUNNER_TEMP/ar/reach.py" || true
+          "$RUNNER_TEMP/ar/uninstall.sh" --dir "$RUNNER_TEMP/ar" --purge
+
+      - name: Installer round trip (Windows, informational)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          .\install.ps1 -Dir "$env:RUNNER_TEMP\ar" -SkipTests
+          schtasks /Query /TN claude-autoresume-detect
+          python "$env:RUNNER_TEMP\ar\reach.py"
+          .\uninstall.ps1 -Dir "$env:RUNNER_TEMP\ar" -Purge
