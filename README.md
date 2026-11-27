@@ -179,9 +179,13 @@ A session is resumed only when all of these hold:
 
 At fire time everything is checked again. If the session has moved on, nothing is sent. A delivered message is never retried.
 
+### When only the background agents stop
+
+Sometimes Claude Code lets the main session finish its turn normally (a grace allowance) while its background agents stop on the limit. The main transcript then has no error. The detector also reads each agent transcript in `<session>/subagents/agent-*.jsonl`. If an agent's last record is a usage limit stop with a parseable reset, the main session is idle (no user turn, and no assistant turn more than 10 minutes after the stop), and its process is alive, one resume is scheduled for the main session at the reset plus the delay. The message names the stopped agents, so the session can SendMessage each one. One resume is sent per reset, however many agents stopped. If the session or an agent continues first, nothing is sent. The same stale, native cron and delivery route rules apply.
+
 ## Limits
 
-* Subagents are not resumed. Only the top level session gets the message, and it decides what to restart.
+* Subagents are not resumed directly. Only the top level session gets the message, and it decides what to restart.
 * The inbox frame format is not a documented API. It may change with a Claude Code update. If it does, the inbox route fails and tmux and the terminal APIs are the fallbacks. `reach.py` shows what works.
 * Background activity is inferred from file modification times, because the transcript does not record running tasks.
 * Native cron detection reads `CronCreate` calls in the transcript and cannot see whether one was deleted later, so it errs toward skipping.

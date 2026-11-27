@@ -35,7 +35,18 @@ def fire(paths, event_id, dry_run=False, runner=lib.run, now=None, pause=None, v
 
     if transcript is None:
         return finish("failed", "transcript not found")
-    if lib.last_turn_event_id(transcript) != event_id:
+    subagent = e.get("kind") == "subagent"
+    message = lib.MESSAGE
+    if subagent:
+        # The parent ended its turn normally, so compare with the turn seen at schedule time.
+        if lib.last_turn_event_id(transcript) != e.get("parent_last"):
+            return finish("superseded", "the session moved on by itself, nothing to resume")
+        ids = [s["agent_id"] for s in lib.stopped_subagents(paths, transcript.parent.name, sid)
+               if s["reset"] == e["reset"]]
+        if not ids:
+            return finish("superseded", "the stopped agents continued by themselves")
+        message = lib.subagent_message(sorted(ids))
+    elif lib.last_turn_event_id(transcript) != event_id:
         return finish("superseded", "the session moved on by itself, nothing to resume")
     procs = lib.find_claude_processes(paths)
     proc = procs.get(sid)
@@ -53,7 +64,7 @@ def fire(paths, event_id, dry_run=False, runner=lib.run, now=None, pause=None, v
         if dry_run:
             lib.log(paths, f"DRY RUN would send to {sid[:8]} via {cand['kind']} ({why})", echo=True)
             return "dry-run"
-        sent, err = lib.send_message(cand, lib.MESSAGE, runner, pause)
+        sent, err = lib.send_message(cand, message, runner, pause)
         if sent:  # a delivered message is never retried on another route
             target, detail = cand, why
             break
@@ -62,7 +73,7 @@ def fire(paths, event_id, dry_run=False, runner=lib.run, now=None, pause=None, v
         return finish("failed", "no route delivered: " + "; ".join(problems))
     # Confirm the session picked it up: the last turn must no longer be the error.
     time.sleep(verify_wait)
-    if lib.last_turn_event_id(transcript) == event_id:
+    if lib.last_turn_event_id(transcript) == (e.get("parent_last") if subagent else event_id):
         # Never retry a message that was delivered: a double resume is worse than a late one.
         return finish("fired", f"sent via {target['kind']}, reaction unconfirmed after {verify_wait}s")
     return finish("fired", f"sent via {target['kind']} ({detail})")

@@ -125,6 +125,9 @@ def scan(paths, now=None, dry_run=False, lookback_hours=48, scheduler=None,
                            "reset": d.event["reset"], "fire_at": d.fire_at, "target": d.target,
                            "limit_type": d.event["limit_type"], "created_at": now,
                            "attempts": prev.get("attempts", 0)}
+            if d.event.get("kind") == "subagent":
+                events[eid].update(kind="subagent", parent_last=d.event["parent_last"],
+                                   agent_ids=d.event["agent_ids"])
         else:
             lib.log(paths, f"systemd-run failed for {unit}: {err}", echo)
             events[eid] = {"session_id": sid, "status": "failed", "reason": err,

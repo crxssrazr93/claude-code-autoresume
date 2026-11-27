@@ -193,6 +193,7 @@ def limit_event(rec, default_tz=None):
     except Exception:
         return None
     info = (rec.get("apiErrorParams") or {}).get("rate_limit_info") or {}
+    info = info or rec.get("rate_limit_info") or {}
     reset = info.get("resetsAt") or (rec.get("quotaLimits") or {}).get("resetsAt")
     source = "resetsAt"
     if not reset:
@@ -233,6 +234,71 @@ def analyze_transcript(path, default_tz=None):
         except Exception:
             continue
     return (event, None) if event else (None, None)
+
+
+SUBAGENT_GRACE = 10 * 60  # a parent turn this soon after the agents stopped is the grace allowance turn
+
+
+def last_turn_record(path):
+    for rec in iter_records_reverse(path):
+        if is_turn(rec):
+            return rec
+    return None
+
+
+def stopped_subagents(paths, slug, session_id, default_tz=None):
+    """Subagents of this session whose last record is a usage-limit stop."""
+    root = paths.projects / slug / session_id / "subagents"
+    out = []
+    if not root.is_dir():
+        return out
+    for f in sorted(root.glob("agent-*.jsonl")):
+        try:
+            rec = next((r for r in iter_records_reverse(f)
+                        if r.get("type") in ("user", "assistant")), None)
+        except OSError:
+            continue
+        ev = limit_event(rec, default_tz) if rec else None
+        if ev:
+            ev["agent_id"] = f.stem[len("agent-"):]
+            out.append(ev)
+    return out
+
+
+def subagent_event(paths, slug, session_id, transcript, default_tz=None):
+    """An event for a parent that ended its turn normally while its subagents
+    were stopped by a usage limit, or None. The parent must have had no user turn
+    and no assistant turn since the stop, apart from the grace allowance turn."""
+    stops = stopped_subagents(paths, slug, session_id, default_tz)
+    if not stops:
+        return None
+    reset = max(s["reset"] for s in stops)
+    group = [s for s in stops if s["reset"] == reset]
+    ts = max(s["ts"] for s in group)
+    rec = last_turn_record(transcript)
+    if rec is None or rec.get("type") != "assistant" or rec.get("isApiErrorMessage"):
+        return None
+    try:
+        if parse_iso(rec["timestamp"]) > ts + SUBAGENT_GRACE:
+            return None  # the parent has moved on since the stop
+    except Exception:
+        return None
+    return {
+        "event_id": f"subagents-{session_id[:8]}-{reset}",
+        "ts": ts,
+        "reset": reset,
+        "reset_source": group[0]["reset_source"],
+        "limit_type": group[0]["limit_type"],
+        "text": "",
+        "kind": "subagent",
+        "agent_ids": sorted(s["agent_id"] for s in group),
+        "parent_last": rec.get("uuid"),
+    }
+
+
+def subagent_message(agent_ids):
+    return (f"Usage limit has reset. Background agents {', '.join(agent_ids)} stopped on the "
+            "limit; SendMessage each to continue, then carry on with the plan.")
 
 
 def last_turn_event_id(path):
@@ -764,7 +830,9 @@ def evaluate(paths, session_id, transcript, procs, state, now, runner=run, tz=No
     session is not stopped on a usage limit."""
     event, prev_ts = analyze_transcript(transcript, tz)
     if not event:
-        return None
+        event = subagent_event(paths, transcript.parent.name, session_id, transcript, tz)
+        if not event:
+            return None
 
     def skip(reason, transient=False):
         return Decision(session_id, "skip", reason, event, transient=transient)
@@ -786,13 +854,17 @@ def evaluate(paths, session_id, transcript, procs, state, now, runner=run, tz=No
         return skip("no live claude process for this session", transient=True)
 
     slug = transcript.parent.name
-    bg_ts = background_activity_ts(paths, slug, session_id)
-    last_active = max(x for x in (prev_ts, bg_ts) if x is not None) if (prev_ts or bg_ts) else None
-    if last_active is None or event["ts"] - last_active > ACTIVE_WINDOW:
-        idle = "never active" if last_active is None else f"idle {int((event['ts'] - last_active) / 60)} min before the limit"
-        return skip(f"not active before the limit ({idle})")
-    why_active = ("turn %d min before the limit" % int((event["ts"] - prev_ts) / 60)
-                  if prev_ts and event["ts"] - prev_ts <= ACTIVE_WINDOW else "background tasks or agents running")
+    if event.get("kind") == "subagent":
+        # The agents were working when the limit stopped them; the parent is idle.
+        why_active = "background agents %s stopped on the limit" % ", ".join(event["agent_ids"])
+    else:
+        bg_ts = background_activity_ts(paths, slug, session_id)
+        last_active = max(x for x in (prev_ts, bg_ts) if x is not None) if (prev_ts or bg_ts) else None
+        if last_active is None or event["ts"] - last_active > ACTIVE_WINDOW:
+            idle = "never active" if last_active is None else f"idle {int((event['ts'] - last_active) / 60)} min before the limit"
+            return skip(f"not active before the limit ({idle})")
+        why_active = ("turn %d min before the limit" % int((event["ts"] - prev_ts) / 60)
+                      if prev_ts and event["ts"] - prev_ts <= ACTIVE_WINDOW else "background tasks or agents running")
 
     lo, hi = event["reset"] - CONFLICT_BEFORE, event["reset"] + CONFLICT_AFTER
     conflict = native_cron_conflict(transcript, max(lo, event["ts"]), hi, tz,

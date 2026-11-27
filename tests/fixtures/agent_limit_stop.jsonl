@@ -1,0 +1,4 @@
+{"type":"user","uuid":"s1","isSidechain":true,"timestamp":"2026-11-23T16:40:00.000Z","message":{"role":"user","content":"research the thing"}}
+{"type":"assistant","uuid":"s2","isSidechain":true,"timestamp":"2026-11-23T16:45:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}
+{"type":"assistant","uuid":"serr","isSidechain":true,"timestamp":"2026-11-23T16:50:33.000Z","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"You've hit your session limit"}]},"apiError":"usage_limit_reached","apiErrorParams":{"rate_limit_info":{"status":"rejected","resetsAt":1795456200,"rateLimitType":"five_hour"}},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429}
+{"type":"attachment","isSidechain":true,"timestamp":"2026-11-23T16:50:34.000Z","attachment":{"type":"deferred_tools_record"}}

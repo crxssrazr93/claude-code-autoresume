@@ -370,6 +370,148 @@ class TestEvaluate(unittest.TestCase):
 
 
 @posix_only
+class TestSubagentStops(unittest.TestCase):
+    """The parent ended its turn normally, but its background agents hit the limit."""
+
+    EID = f"subagents-{SID[:8]}-{RESET}"
+
+    def setUp(self):
+        self.env = Env()
+        self.addCleanup(self.env.close)
+        self.env.transcript("parent_grace_turn.jsonl")
+        self.env.live_session()
+        self.sched = FakeScheduler()
+        self.agents = self.env.paths.projects / SLUG / SID / "subagents"
+        self.agents.mkdir(parents=True)
+
+    def agent(self, agent_id, extra=""):
+        f = self.agents / f"agent-{agent_id}.jsonl"
+        f.write_text((FIX / "agent_limit_stop.jsonl").read_text() + extra)
+        (self.agents / f"agent-{agent_id}.meta.json").write_text("{}")
+        return f
+
+    def parent_append(self, rec):
+        t = self.env.paths.projects / SLUG / f"{SID}.jsonl"
+        with open(t, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+
+    def evaluate(self, now=NOW, state=None):
+        procs = lib.find_claude_processes(self.env.paths)
+        t = self.env.paths.projects / SLUG / f"{SID}.jsonl"
+        return lib.evaluate(self.env.paths, SID, t, procs, state or {"events": {}}, now,
+                            self.env.runner, TZ)
+
+    def scan(self):
+        return detect.scan(self.env.paths, now=NOW, scheduler=self.sched,
+                           runner=self.env.runner, tz=TZ)
+
+    def test_idle_parent_with_stopped_agent_is_scheduled(self):
+        self.agent("aaa111")
+        d = self.evaluate()
+        self.assertEqual(d.action, "schedule", d.reason)
+        self.assertEqual(d.fire_at, RESET + 300)
+        self.assertEqual(d.event["event_id"], self.EID)
+        self.assertEqual(d.event["agent_ids"], ["aaa111"])
+        self.assertEqual(d.target["kind"], "konsole")
+
+    def test_two_stopped_agents_give_one_resume_naming_both(self):
+        self.agent("aaa111")
+        self.agent("bbb222")
+        self.scan()
+        self.scan()
+        self.assertEqual(len(self.sched.calls), 1)
+        e = lib.load_state(self.env.paths)["events"][self.EID]
+        self.assertEqual(e["agent_ids"], ["aaa111", "bbb222"])
+        r = fire.fire(self.env.paths, self.EID, runner=self.env.runner, now=RESET + 300,
+                      pause=0, verify_wait=0)
+        self.assertEqual(r, "fired")
+        sends = [c for c in self.env.calls
+                 if "qdbus" in c[0] and c[3].endswith("sendText") and c[4] != ""]
+        self.assertEqual(sends[0][4], lib.subagent_message(["aaa111", "bbb222"]))
+        self.assertIn("aaa111, bbb222", sends[0][4])
+
+    def test_parent_resumed_by_a_user_turn_is_ignored(self):
+        self.agent("aaa111")
+        self.parent_append({"type": "user", "uuid": "u9", "timestamp": "2026-11-23T16:55:00.000Z",
+                            "message": {"content": "carry on"}})
+        self.assertIsNone(self.evaluate())
+
+    def test_parent_with_a_later_assistant_turn_is_ignored(self):
+        self.agent("aaa111")
+        self.parent_append({"type": "assistant", "uuid": "a9", "timestamp": "2026-11-23T17:30:00.000Z",
+                            "message": {"content": [{"type": "text", "text": "back at work"}]}})
+        self.assertIsNone(self.evaluate())
+
+    def test_agent_that_continued_after_the_error_is_ignored(self):
+        self.agent("aaa111", extra=json.dumps(
+            {"type": "assistant", "uuid": "s9", "isSidechain": True, "timestamp": "2026-11-23T17:55:00.000Z",
+             "message": {"content": [{"type": "text", "text": "continuing"}]}}) + "\n")
+        self.assertIsNone(self.evaluate())
+
+    def test_only_the_stopped_agent_is_named(self):
+        self.agent("aaa111")
+        ok = self.agents / "agent-ccc333.jsonl"
+        ok.write_text(json.dumps({"type": "assistant", "uuid": "s1", "isSidechain": True,
+                                  "timestamp": "2026-11-23T16:50:00.000Z",
+                                  "message": {"content": [{"type": "text", "text": "done"}]}}) + "\n")
+        self.assertEqual(self.evaluate().event["agent_ids"], ["aaa111"])
+
+    def test_no_live_process_is_skipped(self):
+        self.agent("aaa111")
+        shutil.rmtree(self.env.proc / "600")
+        d = self.evaluate()
+        self.assertEqual(d.action, "skip")
+        self.assertIn("no live claude process", d.reason)
+
+    def test_stale_reset_is_skipped(self):
+        self.agent("aaa111")
+        d = self.evaluate(now=RESET + 300 + lib.STALE_AFTER + 60)
+        self.assertEqual(d.action, "skip")
+        self.assertIn("stale", d.reason)
+
+    def test_already_handled_event_is_skipped(self):
+        self.agent("aaa111")
+        d = self.evaluate(state={"events": {self.EID: {"status": "fired"}}})
+        self.assertEqual(d.action, "skip")
+        self.assertIn("already handled", d.reason)
+
+    def test_native_cron_conflict_skips(self):
+        self.agent("aaa111")
+        cron = {"type": "assistant", "uuid": "c1", "timestamp": "2026-11-23T16:45:00.000Z",
+                "message": {"content": [{"type": "tool_use", "id": "tu1", "name": "CronCreate",
+                                         "input": {"cron": "25 23 23 11 *", "recurring": False,
+                                                   "prompt": "resume"}}]}}
+        t = self.env.paths.projects / SLUG / f"{SID}.jsonl"
+        lines = t.read_text().splitlines()
+        lines.insert(2, json.dumps(cron))
+        t.write_text("\n".join(lines) + "\n")
+        orig = lib.proc_start_epoch
+        lib.proc_start_epoch = lambda paths, pid: 0
+        self.addCleanup(setattr, lib, "proc_start_epoch", orig)
+        d = self.evaluate()
+        self.assertEqual(d.action, "skip")
+        self.assertIn("native cron", d.reason)
+
+    def test_fire_aborts_if_the_parent_moved_on(self):
+        self.agent("aaa111")
+        self.scan()
+        self.parent_append({"type": "user", "uuid": "u9", "timestamp": "2026-11-23T17:51:00.000Z",
+                            "message": {"content": "continue"}})
+        r = fire.fire(self.env.paths, self.EID, runner=self.env.runner, pause=0, verify_wait=0)
+        self.assertEqual(r, "superseded")
+
+    def test_fire_aborts_if_the_agents_continued(self):
+        f = self.agent("aaa111")
+        self.scan()
+        with open(f, "a") as h:
+            h.write(json.dumps({"type": "assistant", "uuid": "s9", "isSidechain": True,
+                                "timestamp": "2026-11-23T17:55:00.000Z",
+                                "message": {"content": [{"type": "text", "text": "ok"}]}}) + "\n")
+        r = fire.fire(self.env.paths, self.EID, runner=self.env.runner, pause=0, verify_wait=0)
+        self.assertEqual(r, "superseded")
+
+
+@posix_only
 class TestProcessMapping(unittest.TestCase):
     def setUp(self):
         self.env = Env()
